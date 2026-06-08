@@ -1,0 +1,32 @@
+[package]
+name = "rsomics-sc-pca"
+version = "0.1.0"
+description = "Zero-centered truncated PCA of a single-cell matrix — scanpy sc.pp.pca (arpack) equivalent: X_pca scores, PCs loadings, variance, variance_ratio"
+edition = "2024"
+rust-version = "1.91"
+license = "MIT OR Apache-2.0"
+repository = "https://github.com/omics-rust/rsomics-sc-pca"
+authors = ["Zane Leong <efd@live.com>"]
+
+[[bin]]
+name = "rsomics-sc-pca"
+path = "src/main.rs"
+
+[lib]
+name = "rsomics_sc_pca"
+path = "src/lib.rs"
+doctest = false
+
+[dependencies]
+rsomics-common = { version = "0.6", features = ["rayon"] }
+rsomics-help = { version = "0.3" }
+clap = { version = "4", features = ["derive"] }
+faer = { version = "0.24", default-features = false, features = ["std", "linalg", "rayon"] }
+rayon = "1"
+
+[dev-dependencies]
+criterion = { version = "0.7", default-features = false, features = ["cargo_bench_support"] }
+
+[[bench]]
+name = "bench"
+harness = false
