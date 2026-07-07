@@ -1,6 +1,6 @@
 [package]
 name = "rsomics-sc-pca"
-version = "0.1.0"
+version = "0.1.1"
 description = "Zero-centered truncated PCA of a single-cell matrix — scanpy sc.pp.pca (arpack) equivalent: X_pca scores, PCs loadings, variance, variance_ratio"
 edition = "2024"
 rust-version = "1.91"

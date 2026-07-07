@@ -182,16 +182,19 @@ pub struct Pca {
 }
 
 impl Pca {
-    /// Zero-centered truncated PCA matching scanpy `sc.pp.pca(adata, n_comps,
-    /// zero_center=True)` on the arpack path. Reproduces sklearn `PCA`'s value
-    /// semantics: column-mean centering, `variance = σ²/(n-1)`,
-    /// `variance_ratio = variance / total_var` where `total_var` is the total
-    /// sample variance of the centered matrix, and `svd_flip(u_based=False)`
-    /// sign convention on the loadings.
+    /// Truncated PCA matching scanpy `sc.pp.pca(adata, n_comps)`. With
+    /// `zero_center` it reproduces sklearn `PCA` (arpack): column-mean centering,
+    /// `variance = σ²/(n-1)`, `variance_ratio = variance / total_var` over the
+    /// centered matrix. Without it, sklearn `TruncatedSVD`: no centering,
+    /// `variance = var(scores, ddof=0)` in native singular-value order and
+    /// `variance_ratio` over the summed ddof=0 column variance. Both use the
+    /// `svd_flip(u_based=False)` sign convention.
     ///
     /// # Errors
     /// Errors when `n_comps` is not in `1..min(n_cells, n_features)` (arpack
-    /// requires it strictly below `min`), matching sklearn.
+    /// requires it strictly below `min`), when the input has any non-finite or
+    /// overflowing value (scanpy: "Input X contains NaN/infinity"), or when the
+    /// total variance is zero (every feature constant), matching sklearn.
     pub fn compute(m: &CellMatrix, n_comps: usize, zero_center: bool) -> Result<Pca> {
         let n = m.n_cells();
         let p = m.n_features();
@@ -200,6 +203,15 @@ impl Pca {
             return Err(RsomicsError::InvalidInput(format!(
                 "n_comps={n_comps} must be in 1..min(n_cells,n_features)={min_dim} \
                  (arpack requires it strictly below the minimum dimension)"
+            )));
+        }
+
+        // scanpy raises "Input X contains NaN/infinity" before reaching the solver.
+        if let Some(k) = m.data.iter().position(|v| !v.is_finite()) {
+            return Err(RsomicsError::InvalidInput(format!(
+                "Input X contains NaN/infinity (cell {}, feature {})",
+                k / p,
+                k % p
             )));
         }
 
@@ -222,11 +234,13 @@ impl Pca {
             .map(|i| (0..p).map(|j| xc[(i, j)] * xc[(i, j)]).sum::<f64>())
             .sum::<f64>()
             / dof;
+        if !total_var.is_finite() {
+            return Err(RsomicsError::InvalidInput(
+                "Input X contains NaN/infinity (variance overflowed to non-finite)".into(),
+            ));
+        }
 
-        let (sv, right) = randomized_svd(&xc, n, p, n_comps);
-
-        let variance: Vec<f64> = sv.iter().map(|&s| s * s / dof).collect();
-        let variance_ratio: Vec<f64> = variance.iter().map(|&v| v / total_var).collect();
+        let (sv, right) = randomized_svd(&xc, n, p, n_comps)?;
 
         // loadings rows = right singular vectors (length p); scores = Xc · V.
         let mut loadings = right; // n_comps × p, row-major
@@ -242,6 +256,54 @@ impl Pca {
         }
 
         svd_flip(&mut loadings, &mut scores, n, p, n_comps);
+
+        let (variance, variance_ratio) = if zero_center {
+            // sklearn PCA: eigenvalue variance = σ²/(n-1), ratio over the centered total.
+            if total_var == 0.0 {
+                return Err(RsomicsError::InvalidInput(
+                    "zero total variance (every feature is constant) — PCA is undefined".into(),
+                ));
+            }
+            let variance: Vec<f64> = sv.iter().map(|&s| s * s / dof).collect();
+            let variance_ratio = variance.iter().map(|&v| v / total_var).collect();
+            (variance, variance_ratio)
+        } else {
+            // sklearn TruncatedSVD: variance = var(scores, ddof=0) kept in native
+            // singular-value order; the ratio denominator is the summed ddof=0
+            // column variance of the uncentered input.
+            let variance: Vec<f64> = (0..n_comps)
+                .map(|a| {
+                    let mean = (0..n).map(|i| scores[i * n_comps + a]).sum::<f64>() / n as f64;
+                    (0..n)
+                        .map(|i| {
+                            let d = scores[i * n_comps + a] - mean;
+                            d * d
+                        })
+                        .sum::<f64>()
+                        / n as f64
+                })
+                .collect();
+            let full_var: f64 = (0..p)
+                .into_par_iter()
+                .map(|j| {
+                    let mean = (0..n).map(|i| m.data[i * p + j]).sum::<f64>() / n as f64;
+                    (0..n)
+                        .map(|i| {
+                            let d = m.data[i * p + j] - mean;
+                            d * d
+                        })
+                        .sum::<f64>()
+                        / n as f64
+                })
+                .sum::<f64>();
+            if full_var == 0.0 {
+                return Err(RsomicsError::InvalidInput(
+                    "zero total variance (every feature is constant) — PCA is undefined".into(),
+                ));
+            }
+            let variance_ratio = variance.iter().map(|&v| v / full_var).collect();
+            (variance, variance_ratio)
+        };
 
         // Reshape loadings to features × n_comps (scanpy varm['PCs'] = Vt.T).
         let mut pcs = vec![0.0_f64; p * n_comps];
@@ -331,7 +393,7 @@ impl Pca {
 /// deterministically so two runs are bit-identical.
 ///
 /// Returns descending singular values and `k × p` loading rows (right vectors).
-fn randomized_svd(xc: &Mat<f64>, n: usize, p: usize, k: usize) -> (Vec<f64>, Vec<f64>) {
+fn randomized_svd(xc: &Mat<f64>, n: usize, p: usize, k: usize) -> Result<(Vec<f64>, Vec<f64>)> {
     let par = get_global_parallelism();
     let l = (k + 20).min(p).min(n);
     let n_iter = 3;
@@ -353,7 +415,9 @@ fn randomized_svd(xc: &Mat<f64>, n: usize, p: usize, k: usize) -> (Vec<f64>, Vec
     // B = Qᵀ·Xc (l × p), then a small thin SVD recovers the singular system.
     let mut b = Mat::<f64>::zeros(l, p);
     matmul(&mut b, Accum::Replace, q.transpose(), xc, 1.0, par);
-    let svd = b.thin_svd().unwrap();
+    let svd = b
+        .thin_svd()
+        .map_err(|e| RsomicsError::UpstreamError(format!("SVD did not converge: {e:?}")))?;
     let s = svd.S().column_vector();
     let vt = svd.V(); // p × l, columns = right singular vectors
 
@@ -365,7 +429,7 @@ fn randomized_svd(xc: &Mat<f64>, n: usize, p: usize, k: usize) -> (Vec<f64>, Vec
             loadings[a * p + j] = vt[(j, a)];
         }
     }
-    (sv, loadings)
+    Ok((sv, loadings))
 }
 
 /// One standard-normal draw from a position-seeded splitmix64 + Box-Muller, so
@@ -533,6 +597,48 @@ mod tests {
         let m = small();
         assert!(Pca::compute(&m, 4, true).is_err()); // min(5,4)=4, must be < 4
         assert!(Pca::compute(&m, 0, true).is_err());
+    }
+
+    #[test]
+    fn no_center_variance_is_population_var_of_scores() {
+        let m = small();
+        let pca = Pca::compute(&m, 3, false).unwrap();
+        let (n, k) = (m.n_cells(), 3);
+        for a in 0..k {
+            let mean = (0..n).map(|i| pca.scores[i * k + a]).sum::<f64>() / n as f64;
+            let want = (0..n)
+                .map(|i| {
+                    let d = pca.scores[i * k + a] - mean;
+                    d * d
+                })
+                .sum::<f64>()
+                / n as f64;
+            assert!(
+                (pca.variance[a] - want).abs() <= 1e-9 * want.max(1.0),
+                "PC{a}: variance {} != var(scores,ddof0) {want}",
+                pca.variance[a]
+            );
+        }
+    }
+
+    #[test]
+    fn non_finite_input_errors() {
+        let mut m = small();
+        m.data[3] = f64::NAN;
+        assert!(Pca::compute(&m, 2, true).is_err());
+        m.data[3] = f64::INFINITY;
+        assert!(Pca::compute(&m, 2, false).is_err());
+    }
+
+    #[test]
+    fn all_zero_matrix_errors() {
+        let m = CellMatrix {
+            cell_ids: (0..5).map(|i| format!("c{i}")).collect(),
+            feature_ids: (0..4).map(|j| format!("g{j}")).collect(),
+            data: vec![0.0; 20],
+        };
+        assert!(Pca::compute(&m, 2, true).is_err());
+        assert!(Pca::compute(&m, 2, false).is_err());
     }
 
     #[test]

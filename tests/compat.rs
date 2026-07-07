@@ -128,6 +128,136 @@ fn matches_committed_scanpy_golden() {
     assert!(ld < 1e-5, "loadings abs err {ld:e}");
 }
 
+/// A per-test-unique scratch dir under TMPDIR so parallel tests never collide.
+fn unique_dir(tag: &str) -> PathBuf {
+    use std::sync::atomic::{AtomicU64, Ordering};
+    static N: AtomicU64 = AtomicU64::new(0);
+    let d = std::env::temp_dir().join(format!(
+        "rsomics_sc_pca_{tag}_{}_{}",
+        std::process::id(),
+        N.fetch_add(1, Ordering::Relaxed)
+    ));
+    std::fs::create_dir_all(&d).unwrap();
+    d
+}
+
+/// `--no-zero-center` routes scanpy to sklearn `TruncatedSVD`, whose
+/// `variance = var(scores, ddof=0)` (kept in native singular-value order) and
+/// `variance_ratio` denominator is the summed ddof=0 column variance of the
+/// uncentered input. The float64 golden is captured from scanpy 1.12.1.
+#[test]
+fn matches_committed_scanpy_golden_no_center() {
+    let tmp = unique_dir("nocenter");
+    let var = tmp.join("variance.tsv");
+    let status = Command::new(bin())
+        .arg(golden("matrix.tsv"))
+        .args(["--n-comps", "8", "--no-zero-center"])
+        .arg("--out-scores")
+        .arg(tmp.join("scores.tsv"))
+        .arg("--out-variance")
+        .arg(&var)
+        .status()
+        .unwrap();
+    assert!(
+        status.success(),
+        "rsomics-sc-pca --no-zero-center exited non-zero"
+    );
+
+    let ours = read_labelled(&var);
+    let gold = read_numeric(&golden("scanpy_variance_nocenter.tsv"));
+    let ours_variance: Vec<f64> = ours.iter().map(|r| r[0]).collect();
+    let ours_ratio: Vec<f64> = ours.iter().map(|r| r[1]).collect();
+    let gold_variance: Vec<f64> = gold.iter().map(|r| r[0]).collect();
+    let gold_ratio: Vec<f64> = gold.iter().map(|r| r[1]).collect();
+
+    // Native order, not descending: the golden's PC4 variance exceeds PC3's.
+    assert!(
+        gold_variance[3] > gold_variance[2],
+        "golden must preserve TruncatedSVD's non-descending native order"
+    );
+
+    let ve = max_rel(&ours_variance, &gold_variance);
+    let re = max_rel(&ours_ratio, &gold_ratio);
+    assert!(ve < 1e-9, "no-center variance rel err {ve:e}");
+    assert!(re < 1e-9, "no-center variance_ratio rel err {re:e}");
+}
+
+/// Write `body` to a fresh TSV, run the binary, return (success, stderr).
+fn run_expect(body: &str, extra: &[&str]) -> (bool, String) {
+    let tmp = unique_dir("err");
+    let matrix = tmp.join("m.tsv");
+    std::fs::write(&matrix, body).unwrap();
+    let out = Command::new(bin())
+        .arg(&matrix)
+        .args(["--n-comps", "2"])
+        .args(extra)
+        .arg("--out-scores")
+        .arg(tmp.join("scores.tsv"))
+        .arg("--out-variance")
+        .arg(tmp.join("var.tsv"))
+        .output()
+        .unwrap();
+    (
+        out.status.success(),
+        String::from_utf8_lossy(&out.stderr).into_owned(),
+    )
+}
+
+const HEADER: &str = "\tg0\tg1\tg2\tg3\n";
+const REST_ROWS: &str = "c1\t2\t1\t0\t1\n\
+    c2\t0\t3\t2\t0\n\
+    c3\t3\t1\t0\t2\n\
+    c4\t1\t2\t1\t1\n";
+
+/// scanpy raises `ValueError: Input X contains NaN` — we must fail loud, not
+/// panic on the solver.
+#[test]
+fn rejects_nan_input() {
+    let body = format!("{HEADER}c0\t1\tnan\t3\t4\n{REST_ROWS}");
+    let (ok, err) = run_expect(&body, &[]);
+    assert!(!ok, "NaN input must exit non-zero");
+    assert!(err.contains("NaN/infinity"), "stderr: {err}");
+}
+
+/// An inf literal is equally rejected up front.
+#[test]
+fn rejects_inf_input() {
+    let body = format!("{HEADER}c0\t1\tinf\t3\t4\n{REST_ROWS}");
+    let (ok, err) = run_expect(&body, &[]);
+    assert!(!ok, "inf input must exit non-zero");
+    assert!(err.contains("NaN/infinity"), "stderr: {err}");
+}
+
+/// A finite but huge value whose square overflows to inf during the variance
+/// pass must be caught, not silently turned into a non-finite eigenvalue.
+#[test]
+fn rejects_overflow_input() {
+    let body = format!("{HEADER}c0\t1e160\t2\t3\t4\n{REST_ROWS}");
+    let (ok, err) = run_expect(&body, &[]);
+    assert!(!ok, "overflowing input must exit non-zero");
+    assert!(err.contains("NaN/infinity"), "stderr: {err}");
+}
+
+/// An all-zero matrix has zero total variance; scanpy's arpack fails with
+/// `ARPACK error -9: Starting vector is zero`. We refuse to emit a 0/0 = NaN
+/// variance_ratio and fail loud instead.
+#[test]
+fn rejects_all_zero_matrix() {
+    let body = "\tg0\tg1\tg2\tg3\n\
+        c0\t0\t0\t0\t0\n\
+        c1\t0\t0\t0\t0\n\
+        c2\t0\t0\t0\t0\n\
+        c3\t0\t0\t0\t0\n\
+        c4\t0\t0\t0\t0\n";
+    let (ok, err) = run_expect(body, &[]);
+    assert!(!ok, "all-zero matrix must exit non-zero");
+    assert!(err.contains("zero total variance"), "stderr: {err}");
+    // Same guard on the no-center path.
+    let (ok2, err2) = run_expect(body, &["--no-zero-center"]);
+    assert!(!ok2, "all-zero --no-zero-center must exit non-zero");
+    assert!(err2.contains("zero total variance"), "stderr: {err2}");
+}
+
 #[test]
 fn live_scanpy_differential() {
     let Ok(py) = std::env::var("RSOMICS_SCANPY_PY") else {
