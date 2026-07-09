@@ -79,13 +79,13 @@ impl Tool for Cli {
             })?))
         };
 
-        let scores_out = open_sink(&self.out_scores)?;
+        let scores_out = open_sink(&self.out_scores, self.common.json)?;
         let variance_out = match self.out_variance.as_deref() {
-            Some(path) => open_sink(path)?,
-            None => open_sink("-")?,
+            Some(path) => open_sink(path, self.common.json)?,
+            None => open_sink("-", self.common.json)?,
         };
         let loadings_out = match self.out_loadings.as_deref() {
-            Some(path) => Some(open_sink(path)?),
+            Some(path) => Some(open_sink(path, self.common.json)?),
             None => None,
         };
 
@@ -101,8 +101,10 @@ impl Tool for Cli {
     }
 }
 
-fn open_sink(path: &str) -> Result<Box<dyn Write>> {
-    if path == "-" {
+fn open_sink(path: &str, json: bool) -> Result<Box<dyn Write>> {
+    if path == "-" && json {
+        Ok(Box::new(std::io::sink()))
+    } else if path == "-" {
         Ok(Box::new(BufWriter::new(std::io::stdout().lock())))
     } else {
         Ok(Box::new(BufWriter::new(
